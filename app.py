@@ -1,21 +1,18 @@
 """
 NC Registration System – Streamlit Web App
-Converted from the original Tkinter desktop application.
-Persistent storage: Excel file committed to the same GitHub repo via GitHub API,
-so all records survive app restarts on Streamlit Community Cloud.
+Storage backend: Google Sheets (permanent, survives all restarts/redeployments).
+Local Excel fallback when Google Sheets is not configured.
 """
 
 import io
-import os
-import base64
+import json
 import datetime
 
 import pandas as pd
-import requests
 import streamlit as st
 
 # ─────────────────────────────────────────────
-# Constants (exact values from original app)
+# Constants  (exact values from original Tkinter app)
 # ─────────────────────────────────────────────
 FILE_NAME = "NC_Registration.xlsx"
 
@@ -29,116 +26,121 @@ RESPONSIBILITY_MAP = {
 }
 
 CUSTOMERS = ["Bosch", "Continental", "Valeo", "Cummins", "Delphi"]
-
 FUNCTIONS = ["SMT", "QA", "Production", "Maintenance", "Engineering", "Stores"]
-
-STAGES = ["Incoming", "SPI", "Placement", "Reflow", "AOI", "Testing", "Packing"]
-
-NC_CATEGORIES = ["Major", "Minor"]
-
+STAGES    = ["Incoming", "SPI", "Placement", "Reflow", "AOI", "Testing", "Packing"]
+NC_CATEGORIES   = ["Major", "Minor"]
 SIXM_CATEGORIES = ["Man", "Machine", "Method", "Material", "Measurement", "Mother Nature"]
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
 
-EXCEL_COLUMNS = [
+COLUMNS = [
     "NC Number", "Date", "Month", "Week", "Customer", "Model",
     "Function", "Stage", "Observation", "NC Category", "6M Category",
     "Sub Category", "Responsibility", "NC Raised By", "Action Plan",
 ]
 
-YEAR = 2026
-
 
 # ─────────────────────────────────────────────
-# GitHub Persistent Storage helpers
+# Google Sheets helpers
 # ─────────────────────────────────────────────
 
-def _gh_headers():
-    token = st.secrets.get("GITHUB_TOKEN", os.getenv("GITHUB_TOKEN", ""))
-    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+def _gsheets_configured() -> bool:
+    try:
+        creds = st.secrets.get("gcp_service_account", {})
+        sheet = st.secrets.get("SHEET_ID", "")
+        return bool(creds and sheet)
+    except Exception:
+        return False
 
 
-def _gh_api_url():
-    repo  = st.secrets.get("GITHUB_REPO", os.getenv("GITHUB_REPO", ""))
-    path  = st.secrets.get("GITHUB_FILE_PATH", os.getenv("GITHUB_FILE_PATH", FILE_NAME))
-    return f"https://api.github.com/repos/{repo}/contents/{path}"
+@st.cache_resource(show_spinner=False)
+def _get_gspread_client():
+    """Return an authorised gspread client (cached across reruns)."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.authorize(creds)
 
 
-def _use_github() -> bool:
-    """Return True only when both token and repo are configured."""
-    token = st.secrets.get("GITHUB_TOKEN", os.getenv("GITHUB_TOKEN", ""))
-    repo  = st.secrets.get("GITHUB_REPO",  os.getenv("GITHUB_REPO",  ""))
-    return bool(token and repo)
+def _get_worksheet():
+    """Return the first worksheet of the configured Google Sheet."""
+    client   = _get_gspread_client()
+    sheet_id = st.secrets["SHEET_ID"]
+    sh       = client.open_by_key(sheet_id)
+    return sh.sheet1
 
 
-# ── Read ──────────────────────────────────────
+# ── Read from Google Sheets ──────────────────
+def load_from_gsheets() -> pd.DataFrame:
+    try:
+        ws      = _get_worksheet()
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame(columns=COLUMNS)
+        df = pd.DataFrame(records)
+        # Ensure all expected columns exist
+        for col in COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        return df[COLUMNS]
+    except Exception as e:
+        st.warning(f"⚠️ Could not read Google Sheets: {e}")
+        return pd.DataFrame(columns=COLUMNS)
+
+
+# ── Write one row to Google Sheets ───────────
+def append_to_gsheets(row: dict) -> bool:
+    try:
+        ws = _get_worksheet()
+        # Ensure header row exists
+        existing = ws.get_all_values()
+        if not existing:
+            ws.append_row(COLUMNS, value_input_option="RAW")
+        ws.append_row([str(row.get(c, "")) for c in COLUMNS],
+                      value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        st.error(f"❌ Google Sheets save error: {e}")
+        return False
+
+
+# ── Load dataframe (Google Sheets → local fallback) ──
 def load_dataframe() -> pd.DataFrame:
-    empty = pd.DataFrame(columns=EXCEL_COLUMNS)
-
-    if _use_github():
-        try:
-            resp = requests.get(_gh_api_url(), headers=_gh_headers(), timeout=10)
-            if resp.status_code == 200:
-                content = base64.b64decode(resp.json()["content"])
-                return pd.read_excel(io.BytesIO(content))
-            # 404 means the file doesn't exist yet → return empty frame
-            return empty
-        except Exception:
-            st.warning("⚠️ Could not reach GitHub. Showing local data only.")
-
-    # Local fallback (works on your PC or Streamlit Cloud without GitHub secrets)
-    if os.path.exists(FILE_NAME):
+    if _gsheets_configured():
+        return load_from_gsheets()
+    # Local Excel fallback
+    try:
         return pd.read_excel(FILE_NAME)
-    return empty
+    except Exception:
+        return pd.DataFrame(columns=COLUMNS)
 
 
-# ── Write ─────────────────────────────────────
-def save_dataframe(df: pd.DataFrame):
-    buffer = io.BytesIO()
-    df.to_excel(buffer, index=False, engine="openpyxl")
-    excel_bytes = buffer.getvalue()
-
-    if _use_github():
-        try:
-            # Get current SHA (needed for update)
-            sha = None
-            resp = requests.get(_gh_api_url(), headers=_gh_headers(), timeout=10)
-            if resp.status_code == 200:
-                sha = resp.json()["sha"]
-
-            payload = {
-                "message": f"NC Registration update – {datetime.datetime.utcnow().isoformat()}Z",
-                "content": base64.b64encode(excel_bytes).decode(),
-            }
-            if sha:
-                payload["sha"] = sha
-
-            put = requests.put(_gh_api_url(), headers=_gh_headers(),
-                               json=payload, timeout=15)
-            if put.status_code not in (200, 201):
-                st.error(f"GitHub save failed: {put.status_code} – {put.json().get('message')}")
-                return False
-        except Exception as e:
-            st.error(f"GitHub save error: {e}")
-            return False
-
-    # Always write locally (even when GitHub is configured, for speed)
-    with open(FILE_NAME, "wb") as f:
-        f.write(excel_bytes)
-
-    return True
+# ── Save dataframe (Google Sheets → local fallback) ──
+def save_row(row: dict, df_all: pd.DataFrame) -> bool:
+    if _gsheets_configured():
+        return append_to_gsheets(row)
+    # Local Excel fallback
+    try:
+        df_all.to_excel(FILE_NAME, index=False, engine="openpyxl")
+        return True
+    except Exception as e:
+        st.error(f"❌ Local save error: {e}")
+        return False
 
 
-# ─────────────────────────────────────────────
-# NC Number generation (duplicate-safe)
-# ─────────────────────────────────────────────
-def generate_nc_number(df: pd.DataFrame) -> str:
+# ── Duplicate NC Number check ────────────────
+def nc_number_exists(nc_no: str, df: pd.DataFrame) -> bool:
     if df.empty or "NC Number" not in df.columns:
-        return f"NC-{YEAR}-001"
-
-    existing = df["NC Number"].astype(str).tolist()
-    count = 1
-    while f"NC-{YEAR}-{count:03d}" in existing:
-        count += 1
-    return f"NC-{YEAR}-{count:03d}"
+        return False
+    return nc_no.strip() in df["NC Number"].astype(str).str.strip().tolist()
 
 
 # ─────────────────────────────────────────────
@@ -151,14 +153,12 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────
-# Custom CSS – professional, clean, responsive
+# Custom CSS
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ── Global ── */
 html, body, [class*="css"] { font-family: 'Segoe UI', Arial, sans-serif; }
 
-/* ── Header banner ── */
 .nc-header {
     background: linear-gradient(135deg, #1a5276 0%, #2e86c1 100%);
     color: white;
@@ -170,31 +170,6 @@ html, body, [class*="css"] { font-family: 'Segoe UI', Arial, sans-serif; }
 .nc-header h1 { margin: 0; font-size: 1.7rem; letter-spacing: 1px; }
 .nc-header p  { margin: 4px 0 0; font-size: 0.9rem; opacity: 0.85; }
 
-/* ── Auto-filled info boxes ── */
-.info-box {
-    background: #eaf4fb;
-    border-left: 4px solid #2e86c1;
-    border-radius: 6px;
-    padding: 8px 14px;
-    font-size: 0.95rem;
-    color: #1a5276;
-    font-weight: 600;
-    margin-bottom: 2px;
-}
-
-/* ── Responsibility badge ── */
-.resp-badge {
-    display: inline-block;
-    background: #d5f5e3;
-    color: #1e8449;
-    border: 1px solid #a9dfbf;
-    border-radius: 20px;
-    padding: 4px 14px;
-    font-weight: 700;
-    font-size: 0.95rem;
-}
-
-/* ── Section divider ── */
 .section-title {
     font-size: 1rem;
     font-weight: 700;
@@ -204,39 +179,34 @@ html, body, [class*="css"] { font-family: 'Segoe UI', Arial, sans-serif; }
     margin: 18px 0 10px;
 }
 
-/* ── Save button ── */
-div[data-testid="stButton"] > button {
-    background-color: #1e8449;
-    color: white;
-    font-size: 1rem;
-    font-weight: 700;
-    border-radius: 8px;
-    padding: 10px 32px;
-    border: none;
-    width: 100%;
-    transition: background 0.2s;
+.storage-badge {
+    display: inline-block;
+    padding: 3px 12px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    margin-bottom: 10px;
 }
-div[data-testid="stButton"] > button:hover {
-    background-color: #145a32;
-}
+.badge-sheets { background:#d5f5e3; color:#1e8449; border:1px solid #a9dfbf; }
+.badge-local  { background:#fef9e7; color:#9a7d0a; border:1px solid #f9e79f; }
 
-/* ── Records table ── */
 .stDataFrame { border-radius: 8px; overflow: hidden; }
-
-/* ── Success / Error alerts ── */
-.stAlert { border-radius: 8px; }
+.stAlert     { border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
-# Session-state initialisation
+# Session state
 # ─────────────────────────────────────────────
-if "form_submitted" not in st.session_state:
-    st.session_state.form_submitted = False
-
-if "success_msg" not in st.session_state:
-    st.session_state.success_msg = ""
+defaults = {
+    "success_msg":    "",
+    "error_msgs":     [],
+    "confirm_reset":  False,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
 # ─────────────────────────────────────────────
@@ -249,107 +219,137 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Load existing data
-# ─────────────────────────────────────────────
-df_existing = load_dataframe()
-
-# Auto-computed values
-now = datetime.datetime.now()
-auto_nc_no   = generate_nc_number(df_existing)
-auto_date    = now.strftime("%d-%m-%Y")
-auto_month   = now.strftime("%B")
-auto_week    = str(now.isocalendar()[1])
+# Storage indicator
+if _gsheets_configured():
+    st.markdown('<span class="storage-badge badge-sheets">🟢 Google Sheets – Permanent Storage Active</span>',
+                unsafe_allow_html=True)
+else:
+    st.markdown('<span class="storage-badge badge-local">🟡 Local Excel Storage (configure Google Sheets for cloud deployment)</span>',
+                unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# Success banner (shown after save)
+# Success / error banners
 # ─────────────────────────────────────────────
 if st.session_state.success_msg:
     st.success(st.session_state.success_msg)
     st.session_state.success_msg = ""
 
-# ─────────────────────────────────────────────
-# ── SECTION 1: Auto-filled Information ───────
-# ─────────────────────────────────────────────
-st.markdown('<div class="section-title">🔢 Auto-filled Information</div>', unsafe_allow_html=True)
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown(f'<div class="info-box">NC Number &nbsp;|&nbsp; {auto_nc_no}</div>', unsafe_allow_html=True)
-    st.caption("Auto-generated • read-only")
-
-    st.markdown(f'<div class="info-box">Month &nbsp;|&nbsp; {auto_month}</div>', unsafe_allow_html=True)
-    st.caption("Auto-detected • read-only")
-
-with col2:
-    st.markdown(f'<div class="info-box">Date &nbsp;|&nbsp; {auto_date}</div>', unsafe_allow_html=True)
-    st.caption("Today's date • read-only")
-
-    st.markdown(f'<div class="info-box">Week &nbsp;|&nbsp; {auto_week}</div>', unsafe_allow_html=True)
-    st.caption("ISO week number • read-only")
+for err in st.session_state.error_msgs:
+    st.error(err)
+st.session_state.error_msgs = []
 
 # ─────────────────────────────────────────────
-# ── SECTION 2: Registration Form ─────────────
+# Load data
+# ─────────────────────────────────────────────
+df_existing = load_dataframe()
+
+# ─────────────────────────────────────────────
+# Default values for editable fields
+# ─────────────────────────────────────────────
+now = datetime.datetime.now()
+
+
+# ─────────────────────────────────────────────
+# SECTION 1 – Registration Form
 # ─────────────────────────────────────────────
 st.markdown('<div class="section-title">📝 Registration Details</div>', unsafe_allow_html=True)
 
 with st.form(key="nc_form", clear_on_submit=True):
 
-    col_a, col_b = st.columns(2)
+    # ── Row 1: NC Number + Date ──────────────
+    r1a, r1b = st.columns(2)
+    with r1a:
+        nc_number = st.text_input(
+            "NC Number ✱",
+            value=f"NC-{now.year}-001",
+            placeholder="e.g. NC-2026-001",
+            help="Enter manually. Format: NC-YYYY-NNN",
+        )
+    with r1b:
+        date_picked = st.date_input(
+            "Date ✱",
+            value=now.date(),
+            help="Select the registration date",
+        )
 
-    with col_a:
+    # ── Row 2: Month + Week ─────────────────
+    r2a, r2b = st.columns(2)
+    with r2a:
+        month = st.selectbox(
+            "Month ✱",
+            options=MONTHS,
+            index=now.month - 1,
+            help="Select the month",
+        )
+    with r2b:
+        week = st.text_input(
+            "Week ✱",
+            value=str(now.isocalendar()[1]),
+            placeholder="e.g. 47",
+            help="Enter ISO week number",
+        )
+
+    st.markdown("---")
+
+    # ── Row 3: Customer + Model ──────────────
+    r3a, r3b = st.columns(2)
+    with r3a:
         customer = st.selectbox(
             "Customer ✱",
             options=["-- Select --"] + CUSTOMERS,
-            help="Required field",
+            help="Required",
         )
+    with r3b:
+        model = st.text_input("Model", placeholder="Enter model number / name")
 
+    # ── Row 4: Function + Stage ──────────────
+    r4a, r4b = st.columns(2)
+    with r4a:
         function = st.selectbox(
             "Function ✱",
             options=["-- Select --"] + FUNCTIONS,
-            help="Automatically assigns Responsibility",
         )
-
+    with r4b:
         stage = st.selectbox(
             "Stage ✱",
             options=["-- Select --"] + STAGES,
         )
 
+    # ── Row 5: NC Category + 6M Category ────
+    r5a, r5b = st.columns(2)
+    with r5a:
         nc_category = st.selectbox(
             "NC Category ✱",
             options=["-- Select --"] + NC_CATEGORIES,
         )
-
+    with r5b:
         sixm_category = st.selectbox(
             "6M Category",
             options=["-- Select --"] + SIXM_CATEGORIES,
         )
 
-    with col_b:
-        model = st.text_input("Model", placeholder="Enter model number / name")
-
-        sub_category = st.text_input(
-            "Sub Category",
-            placeholder="Enter sub-category",
-        )
-
+    # ── Row 6: Sub Category + NC Raised By ──
+    r6a, r6b = st.columns(2)
+    with r6a:
+        sub_category = st.text_input("Sub Category", placeholder="Enter sub-category")
+    with r6b:
         raised_by = st.text_input(
             "NC Raised By ✱",
-            placeholder="Enter name of person raising NC",
+            placeholder="Name of person raising NC",
         )
 
-        # Responsibility – auto from Function
-        responsibility = RESPONSIBILITY_MAP.get(
-            function if function != "-- Select --" else "", ""
-        )
-        st.markdown("**Responsibility** (auto-assigned)")
-        if responsibility:
-            st.markdown(f'<span class="resp-badge">👤 {responsibility}</span>',
-                        unsafe_allow_html=True)
-        else:
-            st.caption("_Select a Function above to auto-assign_")
+    # ── Responsibility (manual) ──────────────
+    suggested = RESPONSIBILITY_MAP.get(
+        function if function != "-- Select --" else "", ""
+    )
+    responsibility = st.text_input(
+        "Responsibility ✱",
+        value=suggested,
+        placeholder="Enter responsible person's name",
+        help="Auto-suggested from Function – you can edit it freely.",
+    )
 
+    # ── Observation ──────────────────────────
     st.markdown("**Observation ✱**")
     observation = st.text_area(
         "Observation",
@@ -358,6 +358,7 @@ with st.form(key="nc_form", clear_on_submit=True):
         label_visibility="collapsed",
     )
 
+    # ── Action Plan ──────────────────────────
     st.markdown("**Action Plan**")
     action_plan = st.text_area(
         "Action Plan",
@@ -369,12 +370,18 @@ with st.form(key="nc_form", clear_on_submit=True):
     st.markdown("---")
     submitted = st.form_submit_button("💾  Save Registration", use_container_width=True)
 
+
 # ─────────────────────────────────────────────
 # Form submission handler
 # ─────────────────────────────────────────────
 if submitted:
-    # ── Validation ──────────────────────────
     errors = []
+
+    # Required field validation
+    if not nc_number.strip():
+        errors.append("**NC Number** cannot be empty.")
+    if not week.strip():
+        errors.append("**Week** cannot be empty.")
     if customer == "-- Select --":
         errors.append("Please select a **Customer**.")
     if function == "-- Select --":
@@ -383,21 +390,30 @@ if submitted:
         errors.append("Please select a **Stage**.")
     if nc_category == "-- Select --":
         errors.append("Please select an **NC Category**.")
+    if not responsibility.strip():
+        errors.append("**Responsibility** cannot be empty.")
     if not observation.strip():
         errors.append("**Observation** cannot be empty.")
     if not raised_by.strip():
         errors.append("**NC Raised By** cannot be empty.")
 
+    # Duplicate NC Number check
+    if nc_number.strip() and nc_number_exists(nc_number.strip(), df_existing):
+        errors.append(
+            f"**NC Number `{nc_number.strip()}` already exists.** "
+            "Please use a different NC Number to prevent duplicates."
+        )
+
     if errors:
-        for e in errors:
-            st.error(e)
+        st.session_state.error_msgs = errors
+        st.rerun()
     else:
-        # ── Build new row ────────────────────
+        formatted_date = date_picked.strftime("%d-%m-%Y")
         new_row = {
-            "NC Number":    auto_nc_no,
-            "Date":         auto_date,
-            "Month":        auto_month,
-            "Week":         auto_week,
+            "NC Number":    nc_number.strip(),
+            "Date":         formatted_date,
+            "Month":        month,
+            "Week":         week.strip(),
             "Customer":     customer,
             "Model":        model.strip(),
             "Function":     function,
@@ -406,27 +422,29 @@ if submitted:
             "NC Category":  nc_category,
             "6M Category":  sixm_category if sixm_category != "-- Select --" else "",
             "Sub Category": sub_category.strip(),
-            "Responsibility": responsibility,
+            "Responsibility": responsibility.strip(),
             "NC Raised By": raised_by.strip(),
             "Action Plan":  action_plan.strip(),
         }
 
-        df_new    = pd.DataFrame([new_row])
-        df_final  = pd.concat([df_existing, df_new], ignore_index=True)
+        df_new   = pd.DataFrame([new_row])
+        df_final = pd.concat([df_existing, df_new], ignore_index=True)
 
-        ok = save_dataframe(df_final)
+        ok = save_row(new_row, df_final)
 
         if ok:
             st.session_state.success_msg = (
-                f"✅  **{auto_nc_no}** saved successfully! "
-                f"(Customer: {customer} | Function: {function})"
+                f"✅ **{nc_number.strip()}** saved successfully!  "
+                f"(Customer: {customer} | Function: {function} | "
+                f"Responsibility: {responsibility.strip()})"
             )
+            # Clear cache so records table refreshes
+            _get_gspread_client.clear() if _gsheets_configured() else None
             st.rerun()
-        else:
-            st.error("❌ Save failed. Please check your connection and try again.")
+
 
 # ─────────────────────────────────────────────
-# ── SECTION 3: Registered Records ────────────
+# SECTION 2 – Registered Records
 # ─────────────────────────────────────────────
 st.markdown('<div class="section-title">📊 Registered Records</div>', unsafe_allow_html=True)
 
@@ -435,34 +453,58 @@ df_display = load_dataframe()
 if df_display.empty:
     st.info("No records saved yet. Fill in the form above and click **Save Registration**.")
 else:
+    # Summary metrics
     total      = len(df_display)
     customers_ = df_display["Customer"].nunique() if "Customer" in df_display.columns else 0
     functions_ = df_display["Function"].nunique() if "Function" in df_display.columns else 0
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total NCs", total)
-    m2.metric("Customers", customers_)
-    m3.metric("Functions", functions_)
+    m2.metric("Unique Customers", customers_)
+    m3.metric("Functions Used", functions_)
 
-    st.dataframe(
-        df_display,
-        use_container_width=True,
-        hide_index=True,
-    )
+    # Records table
+    st.dataframe(df_display, use_container_width=True, hide_index=True)
 
-    # ── Excel download ───────────────────────
-    buffer = io.BytesIO()
-    df_display.to_excel(buffer, index=False, engine="openpyxl")
+    # ── Download Excel ───────────────────────
+    buf = io.BytesIO()
+    df_display.to_excel(buf, index=False, engine="openpyxl")
     st.download_button(
         label="⬇️  Download All Records (Excel)",
-        data=buffer.getvalue(),
+        data=buf.getvalue(),
         file_name=FILE_NAME,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
 # ─────────────────────────────────────────────
+# SECTION 3 – Reset Form
+# ─────────────────────────────────────────────
+st.markdown('<div class="section-title">🔄 Reset Form</div>', unsafe_allow_html=True)
+
+if not st.session_state.confirm_reset:
+    if st.button("🗑️  Reset / Clear Form", use_container_width=True):
+        st.session_state.confirm_reset = True
+        st.rerun()
+else:
+    st.warning(
+        "⚠️ **Are you sure?** This will clear all form fields. "
+        "Saved records in Google Sheets / Excel are NOT affected."
+    )
+    col_yes, col_no = st.columns(2)
+    with col_yes:
+        if st.button("✅  Yes, Reset Form", use_container_width=True):
+            st.session_state.confirm_reset = False
+            st.session_state.success_msg   = "Form has been reset."
+            st.rerun()
+    with col_no:
+        if st.button("❌  Cancel", use_container_width=True):
+            st.session_state.confirm_reset = False
+            st.rerun()
+
+# ─────────────────────────────────────────────
 # Footer
 # ─────────────────────────────────────────────
 st.markdown("---")
-st.caption("NC Registration System • Built with Streamlit • Data stored in GitHub Repository")
+storage_label = "Google Sheets" if _gsheets_configured() else "Local Excel"
+st.caption(f"NC Registration System • Built with Streamlit • Storage: {storage_label}")
